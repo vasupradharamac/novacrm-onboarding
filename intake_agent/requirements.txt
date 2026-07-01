@@ -1,0 +1,7 @@
+openai>=1.40.0
+python-dotenv
+pytest
+httpx
+fastapi
+uvicorn
+slack_sdk
