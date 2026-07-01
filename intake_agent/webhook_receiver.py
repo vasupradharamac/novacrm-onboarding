@@ -96,6 +96,15 @@ async def call_result(request: Request):
         "raw_payload": payload,
     })
 
+    # Dialnexa sends multiple events per call (call_initiated, call_ended, ...).
+    # Only call_ended carries the transcript/analysis we need — anything else
+    # (e.g. call_initiated firing seconds after trigger) must be ignored, or
+    # it gets misread as a transcript-less completed call and deletes the
+    # pending-call record before the real call_ended webhook arrives.
+    event_type = payload.get("event_type", "unknown")
+    if event_type != "call_ended":
+        return JSONResponse({"received": True, "ignored": event_type})
+
     # Handle both nested and flat payload shapes
     call_data = payload.get("payload", {}).get("call") or payload
     call_id = call_data.get("id", "unknown")
