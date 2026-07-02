@@ -1,8 +1,8 @@
 """Webhook receiver for Dialnexa call results.
 
 Dialnexa POSTs here when a call ends. We extract the plan tier from
-the raw transcript using OpenAI, then create a Slack channel via the
-Communication Agent.
+the raw transcript using OpenAI, then create a Rocketlane project and
+a Slack channel via the Communication Agent.
 
 Run this with: uvicorn webhook_receiver:app --port 8000 --reload
 Then expose it: ngrok http 8000
@@ -20,9 +20,16 @@ from openai import OpenAI
 load_dotenv()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "communication_agent"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "rocketlane"))
 
 from agent_logger import log_event
 from call_store import delete_pending_call, get_pending_call
+from rocketlane_client import (
+    DuplicateProjectError,
+    RocketlaneAPIDownError,
+    RocketlaneError,
+    create_onboarding_project,
+)
 from slack_agent import create_onboarding_channel
 
 app = FastAPI(title="NovaCRM Onboarding Webhook Receiver")
@@ -96,16 +103,11 @@ async def call_result(request: Request):
         "raw_payload": payload,
     })
 
-    # Dialnexa sends multiple events per call (call_initiated, call_ended, ...).
-    # Only call_ended carries the transcript/analysis we need — anything else
-    # (e.g. call_initiated firing seconds after trigger) must be ignored, or
-    # it gets misread as a transcript-less completed call and deletes the
-    # pending-call record before the real call_ended webhook arrives.
+    # Only process call_ended events
     event_type = payload.get("event_type", "unknown")
     if event_type != "call_ended":
         return JSONResponse({"received": True, "ignored": event_type})
 
-    # Handle both nested and flat payload shapes
     call_data = payload.get("payload", {}).get("call") or payload
     call_id = call_data.get("id", "unknown")
     status = call_data.get("status", "unknown")
@@ -177,7 +179,7 @@ def _handle_confirmed_tier(
     csm_type = "dedicated CSM" if plan_tier == "enterprise" else "pooled CSM"
 
     log_event({
-        "event": "rocketlane_project_queued",
+        "event": "rocketlane_project_creating",
         "customer": customer_name,
         "plan_tier": plan_tier,
         "onboarding_days": days,
@@ -188,10 +190,36 @@ def _handle_confirmed_tier(
         ),
     })
 
-    print(f"\n✅ Plan tier confirmed: {plan_tier.title()} ({days}-day, {csm_type})")
-    print(f"   Rocketlane project creation: pending API access")
+    # Step 1: Create Rocketlane project
+    try:
+        result = create_onboarding_project(
+            customer_name=customer_name,
+            plan_tier=plan_tier,
+            customer_contact_email=deal.get("customer_contact_email", ""),
+            ae_name=ae_name,
+        )
+        project_id = result.get("projectId", "unknown")
+        log_event({
+            "event": "rocketlane_project_created",
+            "customer": customer_name,
+            "plan_tier": plan_tier,
+            "project_id": project_id,
+        })
+        print(f"\n✅ Rocketlane project created! ID: {project_id}")
 
-    # Create Slack channel
+    except DuplicateProjectError as e:
+        log_event({"event": "rocketlane_duplicate_project", "customer": customer_name, "reason": str(e)})
+        print(f"   ⚠️  Duplicate project — skipping: {e}")
+
+    except RocketlaneAPIDownError as e:
+        log_event({"event": "rocketlane_api_down", "customer": customer_name, "reason": str(e)})
+        print(f"   🔴 Rocketlane API down: {e}")
+
+    except RocketlaneError as e:
+        log_event({"event": "rocketlane_error", "customer": customer_name, "reason": str(e)})
+        print(f"   ❌ Rocketlane error: {e}")
+
+    # Step 2: Create Slack channel (runs regardless of Rocketlane outcome)
     try:
         create_onboarding_channel(
             customer_name=customer_name,
@@ -200,11 +228,7 @@ def _handle_confirmed_tier(
         )
     except Exception as e:
         print(f"   ⚠️  Slack channel creation failed: {e}")
-        log_event({
-            "event": "slack_error",
-            "customer": customer_name,
-            "reason": str(e),
-        })
+        log_event({"event": "slack_error", "customer": customer_name, "reason": str(e)})
 
 
 def _escalate(customer_name: str, ae_name: str, deal: dict, reason: str):
