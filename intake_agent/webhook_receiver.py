@@ -321,7 +321,27 @@ def _handle_confirmed_tier(
     except DuplicateProjectError as e:
         print(f"   ⚠️  Duplicate project — skipping: {e}")
     except RocketlaneAPIDownError as e:
-        print(f"   🔴 Rocketlane API down: {e}")
+        log_event({
+            "event": "rocketlane_api_down",
+            "customer": customer_name,
+            "reason": str(e),
+            "decision_rationale": (
+                "Rocketlane API unreachable — project queued for retry. "
+                "Plan tier is confirmed and safe in the audit log."
+            ),
+        })
+        print(f"   🔴 Rocketlane API down — queuing for retry")
+        from call_store import queue_rocketlane_retry
+        queue_rocketlane_retry(customer_name, plan_tier, deal)
+        try:
+            notify_cs_escalation(
+                customer_name=customer_name,
+                ae_name=ae_name,
+                ae_email=deal.get("ae_email", ""),
+                reason=f"Rocketlane API is down — project creation failed. Plan tier is {plan_tier}. Please retry manually or wait for the API to recover.",
+            )
+        except Exception:
+            pass
     except RocketlaneError as e:
         print(f"   ❌ Rocketlane error: {e}")
 
