@@ -1,20 +1,22 @@
 """Webhook receiver for Dialnexa call results.
 
-Dialnexa POSTs here when a call ends. We extract the plan tier from
-the raw transcript using OpenAI, then create a Rocketlane project and
-a Slack channel via the Communication Agent.
+Full retry flow:
+1. Call fires → AE doesn't answer → wait 30s → retry
+2. Retry also fails → send HTML email to AE (CC: CS) with Enterprise/Growth buttons
+3. Someone clicks a button → /confirm-tier → Rocketlane + Slack created
 
-Run this with: uvicorn webhook_receiver:app --port 8000 --reload
-Then expose it: ngrok http 8000
+Run: uvicorn webhook_receiver:app --port 8000 --reload
+Expose: ngrok http 8000
 """
 
+import asyncio
 import os
 import sys
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from openai import OpenAI
 
 load_dotenv()
@@ -23,7 +25,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "communication_
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "rocketlane"))
 
 from agent_logger import log_event
-from call_store import delete_pending_call, get_pending_call
+from call_store import (
+    delete_pending_call,
+    get_by_token,
+    get_pending_call,
+    increment_retry,
+    save_pending_call,
+)
+from dialnexa_client import CallTriggerError, trigger_ae_confirmation_call
+from email_notifier import notify_ae_malformed_email  # noqa: F401
+from email_notifier import notify_cs_escalation, notify_tier_confirmation_needed
 from rocketlane_client import (
     DuplicateProjectError,
     RocketlaneAPIDownError,
@@ -34,10 +45,10 @@ from slack_agent import create_onboarding_channel
 
 app = FastAPI(title="NovaCRM Onboarding Webhook Receiver")
 
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "http://localhost:8000")
+
 
 def register_pending_call(call_id: str, deal_metadata: dict):
-    """Called by poller.py after triggering a Dialnexa call."""
-    from call_store import save_pending_call
     save_pending_call(call_id, deal_metadata)
     log_event({
         "event": "call_registered",
@@ -47,12 +58,7 @@ def register_pending_call(call_id: str, deal_metadata: dict):
 
 
 def extract_plan_tier_from_transcript(transcript: str, customer_name: str) -> str:
-    """Use OpenAI to extract the plan tier from the call transcript.
-
-    Returns 'enterprise', 'growth', or 'unclear'.
-    """
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
     response = client.chat.completions.create(
         model="gpt-4o",
         max_tokens=10,
@@ -78,7 +84,6 @@ def extract_plan_tier_from_transcript(transcript: str, customer_name: str) -> st
             },
         ],
     )
-
     result = response.choices[0].message.content.strip().lower()
     if result not in ("enterprise", "growth", "unclear"):
         return "unclear"
@@ -88,6 +93,60 @@ def extract_plan_tier_from_transcript(transcript: str, customer_name: str) -> st
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/confirm-tier")
+async def confirm_tier(token: str, tier: str):
+    """Called when AE or CS clicks a button in the fallback email."""
+    if tier not in ("enterprise", "growth"):
+        raise HTTPException(status_code=400, detail="Invalid tier")
+
+    call_id, deal = get_by_token(token)
+    if not deal:
+        return HTMLResponse("""
+        <html><body style="font-family:Arial;text-align:center;padding:50px">
+        <h2>⚠️ Link expired or already used</h2>
+        <p>This confirmation link has already been used or has expired.</p>
+        </body></html>
+        """)
+
+    customer_name = deal.get("customer_name", "Unknown")
+    ae_name = deal.get("ae_name", "Unknown AE")
+
+    log_event({
+        "event": "tier_confirmed_via_email",
+        "call_id": call_id,
+        "plan_tier": tier,
+        "customer": customer_name,
+        "decision_rationale": (
+            f"Plan tier '{tier}' confirmed via email button click after failed voice calls. "
+            "Proceeding with Rocketlane project creation."
+        ),
+    })
+
+    print(f"\n✅ Email confirmation received: {customer_name} → {tier.upper()}")
+
+    # Create Rocketlane project + Slack channel
+    _handle_confirmed_tier(customer_name, tier, ae_name, deal)
+    delete_pending_call(call_id)
+
+    days = 30 if tier == "enterprise" else 14
+    return HTMLResponse(f"""
+    <html>
+    <body style="font-family:Arial;text-align:center;padding:50px;max-width:500px;margin:0 auto">
+        <div style="background:#16a34a;color:white;padding:20px;border-radius:8px">
+            <h2>✅ Confirmed!</h2>
+        </div>
+        <div style="padding:24px;background:#f9f9f9;border:1px solid #eee;border-radius:0 0 8px 8px">
+            <p><strong>{customer_name}</strong> has been confirmed as an
+            <strong>{tier.title()} Plan</strong> customer.</p>
+            <p>A {days}-day onboarding project has been created in Rocketlane
+            and a Slack channel has been set up for the customer.</p>
+            <p style="color:#666;font-size:13px">You can close this window.</p>
+        </div>
+    </body>
+    </html>
+    """)
 
 
 @app.post("/call-result")
@@ -103,7 +162,6 @@ async def call_result(request: Request):
         "raw_payload": payload,
     })
 
-    # Only process call_ended events
     event_type = payload.get("event_type", "unknown")
     if event_type != "call_ended":
         return JSONResponse({"received": True, "ignored": event_type})
@@ -116,33 +174,59 @@ async def call_result(request: Request):
     deal = get_pending_call(call_id)
     customer_name = deal.get("customer_name", "Unknown")
     ae_name = deal.get("ae_name", "Unknown AE")
+    retry_count = deal.get("_retry_count", 0)
+    confirmation_token = deal.get("_confirmation_token", "")
 
     print(f"\n{'='*50}")
     print(f"📞 CALL RESULT: {customer_name}")
-    print(f"   Status: {status}")
-    print(f"   Transcript preview: {str(transcript)[:150]}...")
+    print(f"   Status: {status} | Retry #{retry_count}")
 
     # Handle no-answer / failed calls
     if status in ("did_not_pick", "no_answer", "failed", "hangup", "busy"):
-        log_event({
-            "event": "call_not_answered",
-            "call_id": call_id,
-            "status": status,
-            "customer": customer_name,
-            "decision_rationale": (
-                f"Call status was '{status}' — AE did not answer. "
-                "Escalating to CS Manager instead of guessing tier."
-            ),
-        })
-        print(f"   📵 AE did not answer — escalating")
-        _escalate(customer_name, ae_name, deal, reason=f"AE did not answer (status: {status})")
-        delete_pending_call(call_id)
-        return JSONResponse({"received": True, "status": status})
+        if retry_count == 0:
+            # First failure — retry after 30 seconds
+            log_event({
+                "event": "call_not_answered_retrying",
+                "call_id": call_id,
+                "customer": customer_name,
+                "decision_rationale": "First call attempt failed — scheduling retry in 30 seconds.",
+            })
+            print(f"   📵 AE didn't answer — retrying in 30 seconds...")
+            asyncio.create_task(_retry_call_after_delay(call_id, deal, 30))
+        else:
+            # Second failure — send email with buttons
+            log_event({
+                "event": "call_not_answered_both_attempts",
+                "call_id": call_id,
+                "customer": customer_name,
+                "decision_rationale": (
+                    "Both call attempts failed. Sending fallback email to AE "
+                    "with plan tier confirmation buttons. CS Manager CC'd."
+                ),
+            })
+            print(f"   📵 Both attempts failed — sending fallback email...")
+            try:
+                notify_tier_confirmation_needed(
+                    customer_name=customer_name,
+                    ae_name=ae_name,
+                    ae_email=deal.get("ae_email", ""),
+                    cs_email=os.getenv("CS_MANAGER_EMAIL", ""),
+                    customer_contact_email=deal.get("customer_contact_email", ""),
+                    salesforce_link=deal.get("salesforce_link", ""),
+                    confirmation_token=confirmation_token,
+                    webhook_base_url=WEBHOOK_BASE_URL,
+                )
+                print(f"   📨 Fallback email sent to {deal.get('ae_email')} (CC: CS Manager)")
+            except Exception as e:
+                print(f"   ⚠️  Could not send fallback email: {e}")
+                notify_cs_escalation(customer_name, ae_name, deal.get("ae_email", ""), "Both call attempts failed")
+
+        return JSONResponse({"received": True, "status": status, "retry_count": retry_count})
 
     # No transcript
     if not transcript:
         print("   ⚠️  No transcript — escalating")
-        _escalate(customer_name, ae_name, deal, reason="No transcript returned from call")
+        _escalate(customer_name, ae_name, deal, "No transcript returned from call")
         delete_pending_call(call_id)
         return JSONResponse({"received": True, "plan_tier": "unclear"})
 
@@ -158,18 +242,53 @@ async def call_result(request: Request):
         "customer": customer_name,
         "ae": ae_name,
         "decision_rationale": (
-            f"Extracted '{plan_tier}' from call transcript using GPT-4o. "
-            "Transcript-based extraction used for reliability and auditability."
+            f"Extracted '{plan_tier}' from call transcript using GPT-4o."
         ),
     })
 
     if plan_tier in ("enterprise", "growth"):
         _handle_confirmed_tier(customer_name, plan_tier, ae_name, deal)
     else:
-        _escalate(customer_name, ae_name, deal, reason="Tier unclear after completed call")
+        _escalate(customer_name, ae_name, deal, "Tier unclear after completed call")
 
     delete_pending_call(call_id)
     return JSONResponse({"received": True, "plan_tier": plan_tier})
+
+
+async def _retry_call_after_delay(original_call_id: str, deal: dict, delay_seconds: int):
+    """Wait delay_seconds then place a retry call to the AE."""
+    await asyncio.sleep(delay_seconds)
+
+    customer_name = deal.get("customer_name", "Unknown")
+    ae_name = deal.get("ae_name", "Unknown AE")
+    ae_email = deal.get("ae_email", "")
+
+    # Look up AE phone
+    try:
+        from ae_directory import lookup_ae_phone
+        ae_phone = lookup_ae_phone(ae_email)
+    except Exception as e:
+        print(f"   ⚠️  Retry failed — can't look up AE phone: {e}")
+        return
+
+    # Place retry call
+    try:
+        new_call_id = trigger_ae_confirmation_call(
+            ae_phone=ae_phone,
+            customer_name=customer_name,
+            ae_name=ae_name,
+        )
+        increment_retry(original_call_id, new_call_id)
+        log_event({
+            "event": "call_retried",
+            "original_call_id": original_call_id,
+            "new_call_id": new_call_id,
+            "customer": customer_name,
+            "decision_rationale": "First call unanswered — placed retry call to AE.",
+        })
+        print(f"   🔄 Retry call placed: {new_call_id}")
+    except CallTriggerError as e:
+        print(f"   ⚠️  Retry call failed: {e}")
 
 
 def _handle_confirmed_tier(
@@ -184,13 +303,9 @@ def _handle_confirmed_tier(
         "plan_tier": plan_tier,
         "onboarding_days": days,
         "csm_type": csm_type,
-        "decision_rationale": (
-            f"Plan tier confirmed as {plan_tier} by {ae_name} via voice call. "
-            f"Using {days}-day template with {csm_type}."
-        ),
     })
 
-    # Step 1: Create Rocketlane project
+    # Step 1: Rocketlane project
     try:
         result = create_onboarding_project(
             customer_name=customer_name,
@@ -199,27 +314,18 @@ def _handle_confirmed_tier(
             ae_name=ae_name,
         )
         project_id = result.get("projectId", "unknown")
-        log_event({
-            "event": "rocketlane_project_created",
-            "customer": customer_name,
-            "plan_tier": plan_tier,
-            "project_id": project_id,
-        })
+        log_event({"event": "rocketlane_project_created", "customer": customer_name,
+                   "plan_tier": plan_tier, "project_id": project_id})
         print(f"\n✅ Rocketlane project created! ID: {project_id}")
 
     except DuplicateProjectError as e:
-        log_event({"event": "rocketlane_duplicate_project", "customer": customer_name, "reason": str(e)})
         print(f"   ⚠️  Duplicate project — skipping: {e}")
-
     except RocketlaneAPIDownError as e:
-        log_event({"event": "rocketlane_api_down", "customer": customer_name, "reason": str(e)})
         print(f"   🔴 Rocketlane API down: {e}")
-
     except RocketlaneError as e:
-        log_event({"event": "rocketlane_error", "customer": customer_name, "reason": str(e)})
         print(f"   ❌ Rocketlane error: {e}")
 
-    # Step 2: Create Slack channel (runs regardless of Rocketlane outcome)
+    # Step 2: Slack channel
     try:
         create_onboarding_channel(
             customer_name=customer_name,
@@ -237,14 +343,14 @@ def _escalate(customer_name: str, ae_name: str, deal: dict, reason: str):
         "customer": customer_name,
         "ae": ae_name,
         "reason": reason,
-        "decision_rationale": (
-            "Plan tier could not be confirmed — escalating to CS Manager. "
-            "Never guessing tier to avoid wrong template being used."
-        ),
+        "decision_rationale": "Plan tier unconfirmed — escalating to CS Manager.",
         "action_required": (
-            f"CS Manager: manually confirm plan tier for {customer_name} "
+            f"CS Manager: confirm plan tier for {customer_name} "
             f"by contacting {ae_name} ({deal.get('ae_email', '')})"
         ),
     })
     print(f"   ⚠️  ESCALATION: {reason}")
-    print(f"   CS Manager must confirm tier for {customer_name}")
+    try:
+        notify_cs_escalation(customer_name, ae_name, deal.get("ae_email", ""), reason)
+    except Exception as e:
+        print(f"   ⚠️  CS email notification failed: {e}")
