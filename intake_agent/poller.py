@@ -155,6 +155,11 @@ def run_poll_loop():
                     })
                     print(f"❌ Validation failed — missing: {e.missing}")
                     print("   Not proceeding. AE must resend with complete info.")
+                    try:
+                        from email_notifier import notify_ae_malformed_email
+                        notify_ae_malformed_email(raw["sender"], e.missing)
+                    except Exception as email_err:
+                        print(f"   Could not notify AE: {email_err}")
 
             time.sleep(POLL_INTERVAL_SECONDS)
     finally:

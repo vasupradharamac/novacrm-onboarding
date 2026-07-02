@@ -1,37 +1,20 @@
 """Intake & Routing Agent — email parsing and field validation.
 
-Takes the raw text of a "new deal" email an AE sends to the CS inbox and
-extracts the structured fields needed to kick off onboarding. Per Part 3's
-guardrail: if a required field can't be found, this raises rather than
-guessing — the caller is expected to flag for human clarification instead
+Uses a rule-based regex parser instead of an LLM — the email format is
+structured and consistent, so deterministic parsing is faster, cheaper,
+and more predictable than an API call. The LLM only enters the pipeline
+from Dialnexa onwards (transcript extraction).
+
+Per Part 3's guardrail: if a required field can't be found, this raises
+rather than guessing — the caller flags for human clarification instead
 of silently proceeding with incomplete data.
 """
 
-import json
-import os
+import re
 from dataclasses import dataclass
 from typing import Optional
-from dotenv import load_dotenv
-from openai import OpenAI
-load_dotenv()
-
-# client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 REQUIRED_FIELDS = ["customer_name", "customer_contact_email", "ae_name", "ae_email"]
-
-EXTRACTION_SYSTEM_PROMPT = """You extract structured deal-notification data from
-an email an Account Executive sends to a CS team inbox when a new deal closes.
-
-Return ONLY a JSON object with these keys (use null for anything not present
-in the email — never invent a value):
-- customer_name: the company/customer name
-- customer_contact_email: the customer's contact email, if mentioned
-- ae_name: the Account Executive's name (usually the sender)
-- ae_email: the Account Executive's email (usually the sender's email)
-- salesforce_link: the Salesforce opportunity URL, if present
-
-Do not guess the plan tier — it is never in this email by design and is
-confirmed later via phone call. Do not include a plan_tier key at all."""
 
 
 class MissingFieldsError(Exception):
@@ -52,24 +35,70 @@ class ParsedDeal:
     salesforce_link: Optional[str] = None
 
 
+# Patterns ordered from most to least specific
+_PATTERNS = {
+    "customer_name": [
+        r"Customer(?:\s+Company)?(?:\s+Name)?:\s*(.+)",
+        r"Client(?:\s+Name)?:\s*(.+)",
+        r"Account(?:\s+Name)?:\s*(.+)",
+        r"just closed(?:\s+a deal with)?\s+([A-Z][^\n!.]+)",
+    ],
+    "customer_contact_email": [
+        r"Customer\s+Contact(?:\s+Email)?:\s*([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})",
+        r"Contact(?:\s+Email)?:\s*([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})",
+        r"Contact:\s*([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})",
+        # Any email that isn't the sender's own email
+    ],
+    "salesforce_link": [
+        r"Salesforce(?:\s+Opportunity)?(?:\s+Link)?:\s*(https?://\S+)",
+        r"(https?://[^\s]*\.?(?:force|salesforce)\.com/\S+)",
+        r"SF(?:\s+link)?:\s*(https?://\S+)",
+    ],
+    "ae_name": [
+        r"Thanks,\s*\n+\s*([^\n]+)",
+        r"Regards,\s*\n+\s*([^\n]+)",
+        r"Best,\s*\n+\s*([^\n]+)",
+        r"Cheers,\s*\n+\s*([^\n]+)",
+        r"- ([A-Z][a-z]+ [A-Z][a-z]+)(?:\n|$)",
+    ],
+}
+
+
+def _extract_field(pattern_list: list, text: str) -> Optional[str]:
+    for pattern in pattern_list:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            return match.group(1).strip().rstrip(".,;")
+    return None
+
+
 def parse_deal_email(raw_email_text: str, sender_email: str) -> ParsedDeal:
     """Extract structured fields from a raw deal-notification email.
 
     Raises MissingFieldsError if any required field can't be found.
+    No LLM call — pure regex. Fast, free, deterministic.
     """
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Sender email: {sender_email}\n\nEmail body:\n{raw_email_text}",
-            },
-        ],
-    )
-    extracted = json.loads(response.choices[0].message.content)
+    extracted = {}
+
+    for field, patterns in _PATTERNS.items():
+        extracted[field] = _extract_field(patterns, raw_email_text)
+
+    # AE email is always the sender — no need to parse it
+    extracted["ae_email"] = sender_email
+
+    # AE name fallback: use sender's email prefix if not found in body
+    if not extracted.get("ae_name"):
+        extracted["ae_name"] = sender_email.split("@")[0].replace(".", " ").title()
+
+    # Customer contact email: if not found via label, look for any email
+    # in the body that isn't the sender's own address
+    if not extracted.get("customer_contact_email"):
+        all_emails = re.findall(
+            r"[\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,}", raw_email_text
+        )
+        other_emails = [e for e in all_emails if e.lower() != sender_email.lower()]
+        if other_emails:
+            extracted["customer_contact_email"] = other_emails[0]
 
     missing = [f for f in REQUIRED_FIELDS if not extracted.get(f)]
     if missing:
