@@ -46,6 +46,12 @@ from slack_agent import create_onboarding_channel
 app = FastAPI(title="NovaCRM Onboarding Webhook Receiver")
 
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "http://localhost:8000")
+RETRY_DELAY_SECONDS = 10
+
+# asyncio only holds a weak reference to tasks created via create_task — if
+# nothing else references the task, it can be garbage-collected mid-sleep.
+# Keep strong references here so scheduled retries always run to completion.
+_background_tasks: set = set()
 
 
 def register_pending_call(call_id: str, deal_metadata: dict):
@@ -172,6 +178,24 @@ async def call_result(request: Request):
     transcript = call_data.get("transcript", "")
 
     deal = get_pending_call(call_id)
+    if not deal:
+        # Unknown call_id — already processed, already retried, or a stale/
+        # foreign webhook. Do NOT default retry_count to 0 here: that would
+        # make us treat it as a fresh "first failure" and place another
+        # live outbound call for a deal we have no record of.
+        log_event({
+            "event": "webhook_unknown_call_id",
+            "call_id": call_id,
+            "status": status,
+            "decision_rationale": (
+                "Received a call-result webhook for a call_id not in the "
+                "pending-call store — ignoring instead of treating it as a "
+                "new first-attempt failure."
+            ),
+        })
+        print(f"\n⚠️  Ignoring webhook for unknown call_id: {call_id}")
+        return JSONResponse({"received": True, "ignored": "unknown_call_id"})
+
     customer_name = deal.get("customer_name", "Unknown")
     ae_name = deal.get("ae_name", "Unknown AE")
     retry_count = deal.get("_retry_count", 0)
@@ -184,15 +208,17 @@ async def call_result(request: Request):
     # Handle no-answer / failed calls
     if status in ("did_not_pick", "no_answer", "failed", "hangup", "busy"):
         if retry_count == 0:
-            # First failure — retry after 30 seconds
+            # First failure — schedule one retry
             log_event({
                 "event": "call_not_answered_retrying",
                 "call_id": call_id,
                 "customer": customer_name,
-                "decision_rationale": "First call attempt failed — scheduling retry in 30 seconds.",
+                "decision_rationale": f"First call attempt failed — scheduling retry in {RETRY_DELAY_SECONDS} seconds.",
             })
-            print(f"   📵 AE didn't answer — retrying in 30 seconds...")
-            asyncio.create_task(_retry_call_after_delay(call_id, deal, 30))
+            print(f"   📵 AE didn't answer — retrying in {RETRY_DELAY_SECONDS} seconds...")
+            task = asyncio.create_task(_retry_call_after_delay(call_id, deal, RETRY_DELAY_SECONDS))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         else:
             # Second failure — send email with buttons
             log_event({
@@ -338,7 +364,11 @@ def _handle_confirmed_tier(
                 customer_name=customer_name,
                 ae_name=ae_name,
                 ae_email=deal.get("ae_email", ""),
-                reason=f"Rocketlane API is down — project creation failed. Plan tier is {plan_tier}. Please retry manually or wait for the API to recover.",
+                reason=(
+                    f"Rocketlane API is down — project creation failed. "
+                    f"Plan tier confirmed as {plan_tier}. "
+                    f"Project has been queued for retry. Please monitor or retry manually."
+                ),
             )
         except Exception:
             pass

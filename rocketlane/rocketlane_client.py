@@ -120,7 +120,7 @@ def create_onboarding_project(
             f"{ROCKETLANE_BASE_URL}/projects",
             headers=_get_headers(),
             json=payload,
-            timeout=15,
+            timeout=60,
         )
     except httpx.TimeoutException:
         raise RocketlaneAPIDownError("Rocketlane API timed out")
