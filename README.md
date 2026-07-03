@@ -2,8 +2,6 @@
 
 An end-to-end agentic onboarding system that automates customer onboarding for NovaCRM's CS team — from deal notification email to Rocketlane project creation and Slack channel setup.
 
-Built as a Forward Deployed Engineer take-home assignment for [Rocketlane](https://rocketlane.com).
-
 ---
 
 ## What it does
