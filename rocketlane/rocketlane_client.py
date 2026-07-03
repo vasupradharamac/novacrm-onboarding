@@ -48,7 +48,7 @@ def project_exists(customer_name: str) -> bool:
             f"{ROCKETLANE_BASE_URL}/projects",
             headers=_get_headers(),
             params={"search": customer_name},
-            timeout=30,
+            timeout=10,
         )
         if response.status_code == 200:
             projects = response.json().get("data", [])
@@ -120,7 +120,7 @@ def create_onboarding_project(
             f"{ROCKETLANE_BASE_URL}/projects",
             headers=_get_headers(),
             json=payload,
-            timeout=60,
+            timeout=15,
         )
     except httpx.TimeoutException:
         raise RocketlaneAPIDownError("Rocketlane API timed out")
@@ -141,3 +141,28 @@ def create_onboarding_project(
         raise RocketlaneError(
             f"Rocketlane API returned {response.status_code}: {response.text}"
         )
+
+
+def update_task_status(task_id: int, completed: bool) -> dict:
+    """Update a task's status to completed or reopen it."""
+    status_value = 3 if completed else 2
+    status_label = "Completed" if completed else "In Progress"
+
+    try:
+        response = httpx.put(
+            f"{ROCKETLANE_BASE_URL}/tasks/{task_id}",
+            headers=_get_headers(),
+            json={"status": {"value": status_value}},
+            timeout=30,
+        )
+        if response.status_code in (200, 201):
+            print(f"   ✅ Task {task_id} → {status_label}")
+            return response.json()
+        else:
+            raise RocketlaneError(
+                f"Task update failed: {response.status_code} {response.text}"
+            )
+    except httpx.TimeoutException:
+        raise RocketlaneAPIDownError("Rocketlane API timed out on task update")
+    except httpx.RequestError as e:
+        raise RocketlaneAPIDownError(f"Network error: {e}")

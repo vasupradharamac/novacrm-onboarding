@@ -182,7 +182,7 @@ def notify_cs_escalation(customer_name: str, ae_name: str, ae_email: str, reason
         return
 
     subject = f"[NovaCRM] Escalation: {customer_name} onboarding blocked"
-    body = f"""Hi Priya,
+    body = f"""Hi CS,
 
 The automated onboarding pipeline is blocked for {customer_name}.
 
@@ -197,3 +197,119 @@ Please follow up manually.
         _send_email(cs_email, subject, body)
     except Exception as e:
         print(f"   ⚠️  Failed to send CS escalation email: {e}")
+
+
+def notify_task_verification_needed(
+    task_name: str,
+    project_name: str,
+    customer_name: str,
+    phase_name: str,
+    recipient_email: str,
+    confirmation_token: str,
+    webhook_base_url: str,
+):
+    """Send verification email when a critical task is marked complete.
+
+    Used for the 'Data verification sign-off' task — the last task in
+    Data Migration — since the brief explicitly calls out cases where
+    data migration was marked done without real verification.
+
+    The same pattern applies to any phase sign-off task.
+    """
+    yes_url = f"{webhook_base_url}/confirm-task?token={confirmation_token}&action=yes"
+    no_url = f"{webhook_base_url}/confirm-task?token={confirmation_token}&action=no"
+
+    subject = f"[NovaCRM] Verification needed: {task_name} — {project_name}"
+
+    body_plain = f"""Hi,
+
+The following task has been marked as complete in Rocketlane and requires your verification:
+
+Project: {project_name}
+Customer: {customer_name}
+Phase: {phase_name}
+Task: {task_name}
+
+Please confirm whether this task has been genuinely completed:
+
+YES — Task is verified and complete:
+{yes_url}
+
+NO — Task needs to be reopened:
+{no_url}
+
+This verification step exists to prevent tasks being marked done without actual completion,
+particularly for data migration which directly impacts customer go-live.
+
+— NovaCRM Onboarding Agent
+"""
+
+    body_html = f"""
+<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+    <div style="background: #1a1a2e; padding: 20px; border-radius: 8px 8px 0 0;">
+        <h2 style="color: white; margin: 0;">NovaCRM Onboarding</h2>
+        <p style="color: #aaa; margin: 5px 0 0 0;">Task Verification Required</p>
+    </div>
+
+    <div style="background: #f9f9f9; padding: 24px; border: 1px solid #eee;">
+        <p>The following task has been marked as <strong>complete</strong> and requires your verification:</p>
+
+        <div style="background: white; border: 1px solid #ddd; border-radius: 6px; padding: 16px; margin: 16px 0;">
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr>
+                    <td style="padding: 6px 0; color: #666; width: 35%;">Project</td>
+                    <td style="padding: 6px 0;"><strong>{project_name}</strong></td>
+                </tr>
+                <tr>
+                    <td style="padding: 6px 0; color: #666;">Customer</td>
+                    <td style="padding: 6px 0;">{customer_name}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 6px 0; color: #666;">Phase</td>
+                    <td style="padding: 6px 0;">{phase_name}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 6px 0; color: #666;">Task</td>
+                    <td style="padding: 6px 0;"><strong>{task_name}</strong></td>
+                </tr>
+            </table>
+        </div>
+
+        <p>Has this task been <strong>genuinely completed and verified</strong>?</p>
+
+        <div style="text-align: center; margin: 32px 0;">
+            <a href="{yes_url}"
+               style="background: #16a34a; color: white; padding: 14px 28px; border-radius: 6px;
+                      text-decoration: none; font-weight: bold; margin: 0 8px; display: inline-block;">
+                ✅ Yes, verified & complete
+            </a>
+            <a href="{no_url}"
+               style="background: #dc2626; color: white; padding: 14px 28px; border-radius: 6px;
+                      text-decoration: none; font-weight: bold; margin: 0 8px; display: inline-block;">
+                ❌ No, reopen task
+            </a>
+        </div>
+
+        <div style="background: #fef3c7; border: 1px solid #f59e0b; border-radius: 6px; padding: 12px; margin-top: 16px;">
+            <p style="margin: 0; color: #92400e; font-size: 13px;">
+                ⚠️ <strong>Why this matters:</strong> Data migration tasks marked done without
+                verification have caused escalations in the past. This step ensures
+                {customer_name}'s data is genuinely ready before go-live.
+            </p>
+        </div>
+    </div>
+
+    <div style="background: #eee; padding: 12px 24px; border-radius: 0 0 8px 8px; text-align: center;">
+        <p style="color: #888; font-size: 12px; margin: 0;">NovaCRM Onboarding Agent · Automated Verification System</p>
+    </div>
+</body>
+</html>
+"""
+    _send_email(
+        to=recipient_email,
+        subject=subject,
+        body_plain=body_plain,
+        body_html=body_html,
+    )

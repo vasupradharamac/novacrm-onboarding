@@ -177,3 +177,50 @@ if __name__ == "__main__":
     else:
         print(f"DB path: {_get_db_path()}")
         print(f"Pending calls: {list_pending_calls()}")
+
+
+# ── Task verification store ──────────────────────────────────────────────────
+
+def save_task_verification(token: str, task_data: dict):
+    """Store a pending task verification (waiting for PM/Owner to confirm)."""
+    conn = _get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS task_verifications (
+            token TEXT PRIMARY KEY,
+            task_data TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute(
+        "INSERT OR REPLACE INTO task_verifications (token, task_data) VALUES (?, ?)",
+        (token, json.dumps(task_data))
+    )
+    conn.commit()
+    conn.close()
+    print(f"✅ task_verification saved for task {task_data.get('task_id')}")
+
+
+def get_task_verification(token: str) -> dict:
+    conn = _get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS task_verifications (
+            token TEXT PRIMARY KEY,
+            task_data TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    row = conn.execute(
+        "SELECT task_data FROM task_verifications WHERE token = ?",
+        (token,)
+    ).fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
+    return {}
+
+
+def delete_task_verification(token: str):
+    conn = _get_conn()
+    conn.execute("DELETE FROM task_verifications WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()

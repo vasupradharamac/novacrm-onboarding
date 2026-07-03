@@ -404,3 +404,199 @@ def _escalate(customer_name: str, ae_name: str, deal: dict, reason: str):
         notify_cs_escalation(customer_name, ae_name, deal.get("ae_email", ""), reason)
     except Exception as e:
         print(f"   ⚠️  CS email notification failed: {e}")
+
+
+# ── Data Migration Verification Flow ────────────────────────────────────────
+
+@app.post("/task-complete")
+async def task_complete(request: Request):
+    """Receives Rocketlane webhook when a task is marked complete.
+
+    Only acts on 'Data verification sign-off' (last task in Data Migration).
+    When triggered, sends a verification email to the Project Owner/PM
+    asking them to confirm the task was genuinely completed.
+
+    Rocketlane automation setup:
+    - Trigger: Task status updated → Completed
+    - Filter: Task name = 'Data verification sign-off'
+    - Action: HTTP POST to {WEBHOOK_BASE_URL}/task-complete
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Log the raw payload unconditionally — Rocketlane's actual field names/
+    # shape for a "send https request" action aren't confirmed yet, so this
+    # is the only way to see what's really being sent instead of guessing.
+    log_event({
+        "event": "task_complete_webhook_received",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "raw_payload": payload,
+    })
+    print(f"\n📥 /task-complete raw payload: {payload}")
+
+    # The Rocketlane automation's own trigger already filters to
+    # "Task Name is exactly 'Data verification sign-off'" AND "status
+    # changed to Completed" — so by construction, every request that
+    # reaches this endpoint from that automation already satisfies both.
+    # Rocketlane's HTTPS-request body is a flat task object (confirmed via
+    # its own docs-example payload) — no eventType/data wrapper, and no
+    # top-level status field. project/phase are nested under "project" and
+    # "projectPhase" respectively.
+    task_name = payload.get("taskName", "")
+    task_id = payload.get("taskId")
+    project_name = payload.get("project", {}).get("projectName", "Unknown Project")
+    project_id = payload.get("project", {}).get("projectId")
+    phase_name = payload.get("projectPhase", {}).get("projectPhaseName", "Unknown Phase")
+
+    # Safety net in case this endpoint is ever hit directly/misconfigured —
+    # not relied on for the normal Rocketlane automation path.
+    VERIFICATION_TASKS = ["data verification sign-off", "data verification"]
+    if task_name.lower() not in VERIFICATION_TASKS:
+        print(f"   ⚠️  Ignored — taskName was {task_name!r}, expected one of {VERIFICATION_TASKS}")
+        return JSONResponse({"received": True, "ignored": f"not a verification task: {task_name}"})
+
+    # Extract customer name from project name (convention: "{Customer} Onboarding")
+    customer_name = project_name.replace(" Onboarding", "").strip()
+
+    log_event({
+        "event": "task_verification_triggered",
+        "task_id": task_id,
+        "task_name": task_name,
+        "project_name": project_name,
+        "customer": customer_name,
+        "decision_rationale": (
+            f"'{task_name}' marked complete — sending verification email to PM/Owner. "
+            "This guardrail exists because data migration tasks have historically been "
+            "marked done without actual verification, causing go-live escalations."
+        ),
+    })
+
+    # Generate token and store task details
+    import secrets as _secrets
+    from call_store import save_task_verification
+    token = _secrets.token_urlsafe(16)
+    save_task_verification(token, {
+        "task_id": task_id,
+        "task_name": task_name,
+        "project_name": project_name,
+        "project_id": project_id,
+        "phase_name": phase_name,
+        "customer_name": customer_name,
+    })
+
+    # Send verification email to CS Manager / Project Owner
+    from email_notifier import notify_task_verification_needed
+    recipient = os.getenv("CS_MANAGER_EMAIL", "")
+    try:
+        notify_task_verification_needed(
+            task_name=task_name,
+            project_name=project_name,
+            customer_name=customer_name,
+            phase_name=phase_name,
+            recipient_email=recipient,
+            confirmation_token=token,
+            webhook_base_url=WEBHOOK_BASE_URL,
+        )
+        print(f"\n📋 Verification email sent for: {task_name} ({project_name})")
+    except Exception as e:
+        print(f"   ⚠️  Could not send verification email: {e}")
+        log_event({"event": "verification_email_failed", "reason": str(e)})
+
+    return JSONResponse({"received": True, "verification_sent": True})
+
+
+@app.get("/confirm-task")
+async def confirm_task(token: str, action: str):
+    """Called when PM/Owner clicks Yes or No in the verification email."""
+    if action not in ("yes", "no"):
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    from call_store import get_task_verification, delete_task_verification
+    task_data = get_task_verification(token)
+
+    if not task_data:
+        return HTMLResponse("""
+        <html><body style="font-family:Arial;text-align:center;padding:50px">
+        <h2>⚠️ Link expired or already used</h2>
+        <p>This verification link has already been used or has expired.</p>
+        </body></html>
+        """)
+
+    task_id = task_data.get("task_id")
+    task_name = task_data.get("task_name")
+    project_name = task_data.get("project_name")
+    customer_name = task_data.get("customer_name")
+
+    from rocketlane_client import update_task_status
+
+    if action == "yes":
+        # Confirmed complete — keep task as done, log verification
+        try:
+            update_task_status(task_id, completed=True)
+        except Exception as e:
+            print(f"   ⚠️  Could not update task status: {e}")
+
+        log_event({
+            "event": "task_verification_confirmed",
+            "task_id": task_id,
+            "task_name": task_name,
+            "project": project_name,
+            "customer": customer_name,
+            "decision_rationale": "PM/Owner confirmed task genuinely completed via email verification.",
+        })
+        delete_task_verification(token)
+
+        return HTMLResponse(f"""
+        <html>
+        <body style="font-family:Arial;text-align:center;padding:50px;max-width:500px;margin:0 auto">
+            <div style="background:#16a34a;color:white;padding:20px;border-radius:8px">
+                <h2>✅ Verified!</h2>
+            </div>
+            <div style="padding:24px;background:#f9f9f9;border:1px solid #eee;border-radius:0 0 8px 8px">
+                <p><strong>{task_name}</strong> has been verified as genuinely complete.</p>
+                <p>Project: {project_name}<br>Customer: {customer_name}</p>
+                <p style="color:#666;font-size:13px">The task status has been confirmed in Rocketlane. You can close this window.</p>
+            </div>
+        </body>
+        </html>
+        """)
+
+    else:
+        # Not actually done — reopen the task
+        try:
+            update_task_status(task_id, completed=False)
+        except Exception as e:
+            print(f"   ⚠️  Could not reopen task: {e}")
+
+        log_event({
+            "event": "task_verification_rejected",
+            "task_id": task_id,
+            "task_name": task_name,
+            "project": project_name,
+            "customer": customer_name,
+            "decision_rationale": (
+                "PM/Owner indicated task NOT genuinely complete. "
+                "Task reopened in Rocketlane to prevent false completion from reaching go-live."
+            ),
+        })
+        delete_task_verification(token)
+
+        return HTMLResponse(f"""
+        <html>
+        <body style="font-family:Arial;text-align:center;padding:50px;max-width:500px;margin:0 auto">
+            <div style="background:#dc2626;color:white;padding:20px;border-radius:8px">
+                <h2>🔄 Task Reopened</h2>
+            </div>
+            <div style="padding:24px;background:#f9f9f9;border:1px solid #eee;border-radius:0 0 8px 8px">
+                <p><strong>{task_name}</strong> has been reopened in Rocketlane.</p>
+                <p>Project: {project_name}<br>Customer: {customer_name}</p>
+                <p style="color:#666;font-size:13px">
+                    The team has been notified. Please complete the actual data verification
+                    before marking this task done again.
+                </p>
+            </div>
+        </body>
+        </html>
+        """)

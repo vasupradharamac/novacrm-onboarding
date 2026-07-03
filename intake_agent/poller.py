@@ -126,40 +126,51 @@ def run_poll_loop():
 
     try:
         while True:
-            for raw in fetch_unseen_deal_emails(imap):
-                log_event({
-                    "event": "email_received",
-                    "sender": raw["sender"],
-                    "subject": raw["subject"],
-                })
-                print(f"\n📧 New email: '{raw['subject']}' from {raw['sender']}")
-
-                try:
-                    deal = parse_deal_email(raw["body"], raw["sender"])
+            try:
+                for raw in fetch_unseen_deal_emails(imap):
                     log_event({
-                        "event": "email_parsed",
-                        "customer": deal.customer_name,
-                        "ae": deal.ae_name,
+                        "event": "email_received",
+                        "sender": raw["sender"],
+                        "subject": raw["subject"],
                     })
-                    handle_new_deal(deal)
+                    print(f"\n📧 New email: '{raw['subject']}' from {raw['sender']}")
 
-                except MissingFieldsError as e:
-                    log_event({
-                        "event": "validation_failed",
-                        "missing_fields": e.missing,
-                        "extracted_so_far": e.extracted,
-                        "decision_rationale": (
-                            "Required fields missing — flagging for clarification "
-                            "instead of guessing."
-                        ),
-                    })
-                    print(f"❌ Validation failed — missing: {e.missing}")
-                    print("   Not proceeding. AE must resend with complete info.")
                     try:
-                        from email_notifier import notify_ae_malformed_email
-                        notify_ae_malformed_email(raw["sender"], e.missing)
-                    except Exception as email_err:
-                        print(f"   Could not notify AE: {email_err}")
+                        deal = parse_deal_email(raw["body"], raw["sender"])
+                        log_event({
+                            "event": "email_parsed",
+                            "customer": deal.customer_name,
+                            "ae": deal.ae_name,
+                        })
+                        handle_new_deal(deal)
+
+                    except MissingFieldsError as e:
+                        log_event({
+                            "event": "validation_failed",
+                            "missing_fields": e.missing,
+                            "extracted_so_far": e.extracted,
+                            "decision_rationale": (
+                                "Required fields missing — flagging for clarification "
+                                "instead of guessing."
+                            ),
+                        })
+                        print(f"❌ Validation failed — missing: {e.missing}")
+                        print("   Not proceeding. AE must resend with complete info.")
+                        try:
+                            from email_notifier import notify_ae_malformed_email
+                            notify_ae_malformed_email(raw["sender"], e.missing)
+                        except Exception as email_err:
+                            print(f"   Could not notify AE: {email_err}")
+
+            except (imaplib.IMAP4.abort, OSError) as e:
+                log_event({"event": "imap_reconnect", "reason": str(e)})
+                print(f"⚠️  IMAP connection dropped ({e}) — reconnecting...")
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
+                imap = connect()
+                continue
 
             time.sleep(POLL_INTERVAL_SECONDS)
     finally:
